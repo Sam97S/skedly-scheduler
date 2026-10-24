@@ -21,6 +21,21 @@ function sanitizeFilename(name) {
   return [...(cleaned || 'attachment')].slice(0, 160).join('');
 }
 
+function parseMimeType(value) {
+  const mime = String(value || 'application/octet-stream').trim();
+  if (!mime || mime.length > 200 || /[\x00-\x1f\x7f]/.test(mime)) throw error('invalid_mime_type');
+  const [rawBase, ...rawParams] = mime.split(';');
+  const base = rawBase.trim().toLowerCase();
+  if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(base)) throw error('invalid_mime_type');
+  for (const raw of rawParams) {
+    const parameter = raw.trim();
+    if (!parameter || !/^[a-z0-9!#$&^_.+-]+\s*=\s*(?:[a-z0-9!#$&^_.+\-]+|"[^"\r\n]*")$/i.test(parameter)) {
+      throw error('invalid_mime_type');
+    }
+  }
+  return { mime, base };
+}
+
 // Bound the entire multipart envelope as well as the actual file. Native Node
 // multipart parsing avoids hand-written boundary parsing and extra dependencies.
 async function readMultipart(req, maxBytes) {
@@ -63,11 +78,12 @@ class MediaStore {
     if (!file || typeof file.arrayBuffer !== 'function') throw error('file_required');
     if (file.size > this.maxBytes) throw error('media_too_large', 413);
     if (!file.size) throw error('empty_file');
-    const mime = file.type || 'application/octet-stream';
-    if (mime.length > 200 || !/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(mime)) throw error('invalid_mime_type');
-    if (kind === 'image' && !mime.startsWith('image/')) throw error('image_mime_required');
-    if (kind === 'voice' && !mime.startsWith('audio/') && mime !== 'application/ogg') throw error('voice_mime_required');
+    const { mime, base: mimeBase } = parseMimeType(file.type || 'application/octet-stream');
+    if (kind === 'image' && !mimeBase.startsWith('image/')) throw error('image_mime_required');
+    if (kind === 'voice' && !mimeBase.startsWith('audio/') && mimeBase !== 'application/ogg') throw error('voice_mime_required');
     const bytes = Buffer.from(await file.arrayBuffer());
+    const digest = hash(bytes);
+    const originalFilename = sanitizeFilename(file.name);
     const id = randomUUID(), target = path.join(this.root, id), temp = target + '.tmp';
     // All filesystem finalization + metadata registration is synchronous while
     // holding SQLite's writer lock. Concurrent replays cannot create duplicates.
@@ -75,7 +91,10 @@ class MediaStore {
     try {
       const existing = this.db.prepare('SELECT * FROM media WHERE client_media_id = ?').get(clientId.trim());
       if (existing) {
+        const sameRequest = existing.kind === kind && existing.original_filename === originalFilename &&
+          existing.mime_type === mime && existing.size_bytes === bytes.length && existing.sha256 === digest;
         this.db.exec('COMMIT');
+        if (!sameRequest) throw error('clientMediaId_conflict', 409);
         return { status: 200, body: { ...serializeMedia(existing), idempotentReplay: true } };
       }
       const fd = fs.openSync(temp, 'wx', 0o600);
@@ -84,12 +103,12 @@ class MediaStore {
       this.syncDirectory();
       this.db.prepare(`INSERT INTO media
         (id,client_media_id,kind,original_filename,mime_type,size_bytes,sha256,storage_path,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)`).run(id, clientId.trim(), kind, sanitizeFilename(file.name), mime,
-          bytes.length, hash(bytes), target, new Date(this.now()).toISOString());
+        VALUES (?,?,?,?,?,?,?,?,?)`).run(id, clientId.trim(), kind, originalFilename, mime,
+          bytes.length, digest, target, new Date(this.now()).toISOString());
       this.db.exec('COMMIT');
       return { status: 201, body: serializeMedia(this.get(id)) };
     } catch (failure) {
-      this.db.exec('ROLLBACK');
+      try { this.db.exec('ROLLBACK'); } catch {}
       for (const name of [temp, target]) { try { fs.unlinkSync(name); } catch {} }
       throw failure;
     }
@@ -143,4 +162,4 @@ class MediaStore {
     this.syncDirectory();
   }
 }
-module.exports = { MediaStore, serializeMedia, sanitizeFilename };
+module.exports = { MediaStore, serializeMedia, sanitizeFilename, parseMimeType };
