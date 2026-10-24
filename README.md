@@ -1,47 +1,42 @@
-# Skedly Scheduler — deployment smoke test
+# Skedly Scheduler — Milestone 2
 
-Minimal first-step container for validating the deployment path:
+This version adds a persistent local scheduler, still without WAHA integration.
 
-GitHub repository → Hostinger Docker Manager → Docker container
+## Included
 
-This version intentionally does **not** include:
-- WAHA integration
-- SQLite
-- scheduling
-- Traefik labels
-- authentication
-- retries
+- SQLite persistence at `/data/skedly-scheduler.db`
+- `POST /v1/messages`
+- `GET /v1/messages`
+- `GET /v1/messages/:id`
+- `PATCH /v1/messages/:id`
+- `DELETE /v1/messages/:id`
+- `GET /health`
+- `GET /status`
+- background worker
+- atomic claim using SQLite transaction
+- lease recovery
+- `clientMessageId` UNIQUE
+- local dry-run execution:
+  `pending → processing → sent`
 
-## Endpoint
+## Important
 
-`GET /health`
+This milestone intentionally does **not** call WAHA yet.
 
-Expected response:
+When a due message is executed, the worker logs it and marks it `sent` locally. This proves that persistence and timed execution work before adding WhatsApp.
+
+## Example message
 
 ```json
 {
-  "status": "ok",
-  "service": "skedly-scheduler"
+  "clientMessageId": "test-123",
+  "session": "default",
+  "chatId": "393331234567@c.us",
+  "type": "text",
+  "payload": {
+    "text": "Test Skedly"
+  },
+  "scheduledAt": "2026-10-24T15:30:00Z",
+  "timezone": "Europe/Rome"
 }
 ```
-
-## Validation
-
-```bash
-docker compose config -q
-docker compose up -d --build
-docker compose ps
-curl http://127.0.0.1:8080/health
-docker compose logs --tail=100
-```
-
-## Success criteria
-
-1. Compose configuration validates.
-2. Container is created.
-3. Container remains running.
-4. Health status becomes healthy.
-5. `GET /health` returns HTTP 200.
-6. Container survives a restart and `/health` still works.
-
-After this passes on Hostinger, add SQLite persistence and the actual scheduler in a separate iteration.
