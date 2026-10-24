@@ -3,6 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const { randomUUID, timingSafeEqual } = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
+const { migrate } = require('./migrations');
+const { MediaStore } = require('./media');
+const { Delivery } = require('./delivery');
 
 const HOST = '0.0.0.0';
 const PORT = Number(process.env.PORT || 8080);
@@ -10,6 +13,10 @@ const DB_PATH = process.env.DB_PATH || '/data/skedly-scheduler.db';
 const WORKER_INTERVAL_MS = Math.max(250, Number(process.env.WORKER_INTERVAL_MS || 1000));
 const LEASE_MS = Math.max(5000, Number(process.env.LEASE_MS || 30000));
 const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_MEDIA_BYTES = Number(process.env.MAX_MEDIA_BYTES || 26214400);
+const MEDIA_DIR = process.env.MEDIA_DIR || '/data/media';
+const CLEANUP_INTERVAL_MS = Math.max(1000, Number(process.env.CLEANUP_INTERVAL_MS || 3600000));
+if (!Number.isSafeInteger(MAX_MEDIA_BYTES) || MAX_MEDIA_BYTES < 1) throw new Error('invalid_MAX_MEDIA_BYTES');
 
 const DELIVERY_MODE = String(process.env.DELIVERY_MODE || 'local').trim().toLowerCase();
 const WAHA_BASE_URL = String(process.env.WAHA_BASE_URL || 'http://waha:3000').replace(/\/+$/, '');
@@ -32,6 +39,7 @@ fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA foreign_keys = ON;');
+db.exec('PRAGMA synchronous = FULL;');
 db.exec('PRAGMA busy_timeout = 5000;');
 
 db.exec(`
@@ -59,6 +67,12 @@ db.exec(`
   ON messages(status, scheduled_at, next_retry_at);
 `);
 
+migrate(db);
+const mediaStore = new MediaStore(db, MEDIA_DIR, MAX_MEDIA_BYTES);
+const deliveryClient = new Delivery(db, mediaStore, {
+  baseUrl: WAHA_BASE_URL, apiKey: WAHA_API_KEY, timeoutMs: WAHA_TIMEOUT_MS, leaseMs: LEASE_MS
+});
+
 const insertMessage = db.prepare(`
   INSERT INTO messages (
     id, client_message_id, session, chat_id, type, payload_json,
@@ -81,23 +95,18 @@ const dueMessageStmt = db.prepare(`
 `);
 const claimMessageStmt = db.prepare(`
   UPDATE messages
-  SET status = 'processing', attempts = attempts + 1, lease_until = ?, updated_at = ?
+  SET status = 'processing', attempts = attempts + 1, lease_until = ?, updated_at = ?, lease_token = ?
   WHERE id = ? AND status = 'pending'
-`);
-const markSentStmt = db.prepare(`
-  UPDATE messages
-  SET status = 'sent', sent_at = ?, lease_until = NULL, updated_at = ?, waha_message_id = ?, last_error = NULL
-  WHERE id = ? AND status = 'processing'
-`);
-const markFailedStmt = db.prepare(`
-  UPDATE messages
-  SET status = 'failed', lease_until = NULL, updated_at = ?, last_error = ?
-  WHERE id = ? AND status = 'processing'
 `);
 const markUnknownStmt = db.prepare(`
   UPDATE messages
   SET status = 'unknown', lease_until = NULL, updated_at = ?, last_error = ?
-  WHERE id = ? AND status = 'processing'
+  WHERE id = ? AND status = 'processing' AND lease_token = ?
+`);
+const resumeConfirmedVoiceStmt = db.prepare(`
+  UPDATE messages SET status = 'pending', lease_until = NULL, lease_token = NULL, updated_at = ?
+  WHERE status = 'processing' AND lease_until < ? AND type = 'voice'
+    AND media_sent_at IS NOT NULL AND delivery_started_at IS NULL
 `);
 const recoverExpiredStmt = db.prepare(`
   UPDATE messages
@@ -140,7 +149,9 @@ function serializeMessage(row) {
     updatedAt: row.updated_at,
     sentAt: row.sent_at,
     wahaMessageId: row.waha_message_id,
-    lastError: row.last_error
+    lastError: row.last_error,
+    mediaSentAt: row.media_sent_at,
+    followupTextSentAt: row.followup_text_sent_at
   };
 }
 
@@ -168,10 +179,10 @@ function readJson(req) {
       size += chunk.length;
       if (size > MAX_BODY_BYTES) {
         reject(Object.assign(new Error('payload_too_large'), { statusCode: 413 }));
-        req.destroy();
+        chunks.length = 0;
         return;
       }
-      chunks.push(chunk);
+      if (size <= MAX_BODY_BYTES) chunks.push(chunk);
     });
 
     req.on('end', () => {
@@ -187,11 +198,26 @@ function readJson(req) {
   });
 }
 
+function validatePayload(type, payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return 'invalid_payload';
+  if (type === 'text') return typeof payload.text === 'string' && payload.text.trim() ? null : 'payload_text_required';
+  if (typeof payload.mediaId !== 'string' || !payload.mediaId.trim()) return 'payload_mediaId_required';
+  const optional = type === 'voice' ? 'followupText' : 'caption';
+  if (payload[optional] != null && typeof payload[optional] !== 'string') return `invalid_${optional}`;
+  if (Object.keys(payload).some(key => !['mediaId', optional].includes(key))) return 'unsupported_media_payload_field';
+  return null;
+}
+function canonicalPayload(type, payload) {
+  if (type === 'text') return { text: payload.text };
+  const optional = type === 'voice' ? 'followupText' : 'caption';
+  return { mediaId: payload.mediaId.trim(), ...(payload[optional] != null ? { [optional]: payload[optional] } : {}) };
+}
 function validateCreate(input) {
-  if (!input || typeof input !== 'object') return 'invalid_body';
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return 'invalid_body';
   if (typeof input.chatId !== 'string' || !input.chatId.trim()) return 'chatId_required';
-  if (input.type !== 'text') return 'type_must_be_text_for_current_mvp';
-  if (!input.payload || typeof input.payload.text !== 'string' || !input.payload.text.trim()) return 'payload_text_required';
+  if (!['text', 'image', 'file', 'voice'].includes(input.type)) return 'invalid_type';
+  const payloadError = validatePayload(input.type, input.payload);
+  if (payloadError) return payloadError;
   if (!isIsoDate(input.scheduledAt)) return 'scheduledAt_must_be_iso_datetime';
   if (input.clientMessageId != null && (typeof input.clientMessageId !== 'string' || !input.clientMessageId.trim())) return 'invalid_clientMessageId';
   return null;
@@ -213,7 +239,7 @@ function claimNextDueMessage() {
     const due = dueMessageStmt.get(now, now);
     if (due) {
       const leaseUntil = new Date(Date.now() + LEASE_MS).toISOString();
-      const result = claimMessageStmt.run(leaseUntil, now, due.id);
+      const result = claimMessageStmt.run(leaseUntil, now, randomUUID(), due.id);
       if (result.changes === 1) id = due.id;
     }
     db.exec('COMMIT');
@@ -222,116 +248,46 @@ function claimNextDueMessage() {
     throw error;
   }
 
-  return id ? serializeMessage(getMessageStmt.get(id)) : null;
-}
-
-function extractWahaMessageId(data) {
-  if (!data || typeof data !== 'object') return null;
-  const candidates = [
-    data.id,
-    data?.key?.id,
-    data?._data?.id,
-    data?.message?.id
-  ];
-  const found = candidates.find(value => typeof value === 'string' && value.trim());
-  return found || null;
-}
-
-async function sendTextViaWaha(message) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), WAHA_TIMEOUT_MS);
-  const url = `${WAHA_BASE_URL}/api/sendText`;
-  const body = {
-    session: message.session || 'default',
-    chatId: message.chatId,
-    text: message?.payload?.text || ''
-  };
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'X-Api-Key': WAHA_API_KEY
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-
-    const raw = await response.text();
-    let data = null;
-    if (raw) {
-      try { data = JSON.parse(raw); } catch { data = { raw }; }
-    }
-
-    if (response.ok) {
-      return {
-        outcome: 'sent',
-        wahaMessageId: extractWahaMessageId(data),
-        httpStatus: response.status
-      };
-    }
-
-    const detail = `waha_http_${response.status}${raw ? `:${raw.slice(0, 500)}` : ''}`;
-    if (response.status >= 500) {
-      return { outcome: 'unknown', error: detail, httpStatus: response.status };
-    }
-    return { outcome: 'failed', error: detail, httpStatus: response.status };
-  } catch (error) {
-    const reason = error?.name === 'AbortError'
-      ? `waha_timeout_after_${WAHA_TIMEOUT_MS}ms`
-      : `waha_transport_error:${String(error?.message || error)}`;
-    return { outcome: 'unknown', error: reason, httpStatus: null };
-  } finally {
-    clearTimeout(timeout);
-  }
+  if (!id) return null;
+  const row = getMessageStmt.get(id);
+  return { ...serializeMessage(row), leaseToken: row.lease_token };
 }
 
 async function executeMessage(message) {
-  const text = message?.payload?.text || '';
-  console.log(`[SCHEDULER] executing id=${message.id} clientMessageId=${message.clientMessageId} chatId=${message.chatId} mode=${DELIVERY_MODE} text=${JSON.stringify(text)}`);
-
-  if (DELIVERY_MODE === 'local') {
-    const now = nowIso();
-    const result = markSentStmt.run(now, now, null, message.id);
-    if (result.changes !== 1) throw new Error(`unable_to_mark_sent:${message.id}`);
-    console.log(`[SCHEDULER] sent-local id=${message.id} at=${now}`);
-    return;
-  }
-
-  const delivery = await sendTextViaWaha(message);
-  const completedAt = nowIso();
-
+  console.log(`[SCHEDULER] executing id=${message.id} type=${message.type} mode=${DELIVERY_MODE}`);
+  const delivery = DELIVERY_MODE === 'local' ? { outcome: 'sent', wahaMessageId: null } : await deliveryClient.execute(message);
+  const now = nowIso();
   if (delivery.outcome === 'sent') {
-    const result = markSentStmt.run(completedAt, completedAt, delivery.wahaMessageId, message.id);
-    if (result.changes !== 1) throw new Error(`unable_to_mark_sent:${message.id}`);
-    console.log(`[SCHEDULER] sent-waha id=${message.id} httpStatus=${delivery.httpStatus} wahaMessageId=${delivery.wahaMessageId || 'none'} at=${completedAt}`);
-    return;
+    if (!deliveryClient.fencedUpdate(message, "status = 'sent', sent_at = ?, lease_until = NULL, updated_at = ?, waha_message_id = COALESCE(?, waha_message_id), last_error = NULL",
+      [now, now, delivery.wahaMessageId])) {
+      markUnknownStmt.run(now, 'delivery_lease_lost', message.id, message.leaseToken);
+      return;
+    }
+    console.log(`[SCHEDULER] sent-${DELIVERY_MODE} id=${message.id}`);
+  } else {
+    if (delivery.outcome === 'failed') {
+      if (!deliveryClient.fencedUpdate(message, "status = 'failed', lease_until = NULL, updated_at = ?, last_error = ?",
+        [now, delivery.error])) markUnknownStmt.run(now, 'delivery_lease_lost', message.id, message.leaseToken);
+    } else markUnknownStmt.run(now, delivery.error, message.id, message.leaseToken);
+    console.log(`[SCHEDULER] ${delivery.outcome} id=${message.id} error=${delivery.error}`);
   }
-
-  if (delivery.outcome === 'failed') {
-    markFailedStmt.run(completedAt, delivery.error, message.id);
-    console.error(`[SCHEDULER] failed-waha id=${message.id} httpStatus=${delivery.httpStatus} error=${delivery.error}`);
-    return;
-  }
-
-  markUnknownStmt.run(completedAt, delivery.error, message.id);
-  console.error(`[SCHEDULER] unknown-waha id=${message.id} httpStatus=${delivery.httpStatus ?? 'none'} error=${delivery.error}`);
 }
 
 let workerBusy = false;
+let shuttingDown = false;
 async function runWorker() {
-  if (workerBusy) return;
+  if (workerBusy || shuttingDown) return;
   workerBusy = true;
   try {
     const now = nowIso();
+    resumeConfirmedVoiceStmt.run(now, now);
     const recovered = recoverExpiredStmt.run(now, now);
     if (recovered.changes > 0) {
       console.warn(`[SCHEDULER] recovered_expired_leases_to_unknown count=${recovered.changes}`);
     }
 
     for (let i = 0; i < 20; i += 1) {
+      if (shuttingDown) break;
       const message = claimNextDueMessage();
       if (!message) break;
 
@@ -339,12 +295,12 @@ async function runWorker() {
         await executeMessage(message);
       } catch (error) {
         const failedAt = nowIso();
-        markUnknownStmt.run(failedAt, `scheduler_execution_error:${String(error?.message || error)}`, message.id);
-        console.error(`[SCHEDULER] execution_error_to_unknown id=${message.id}`, error);
+        markUnknownStmt.run(failedAt, 'scheduler_execution_error', message.id, message.leaseToken);
+        console.error(`[SCHEDULER] execution_error_to_unknown id=${message.id}`);
       }
     }
   } catch (error) {
-    console.error('[SCHEDULER] worker_error', error);
+    console.error('[SCHEDULER] worker_error');
   } finally {
     workerBusy = false;
   }
@@ -403,6 +359,11 @@ async function handleRequest(req, res) {
     });
   }
 
+  if (req.method === 'POST' && pathname === '/v1/media') {
+    const result = await mediaStore.upload(req);
+    return json(res, result.status, result.body);
+  }
+
   if (req.method === 'POST' && pathname === '/v1/messages') {
     const input = await readJson(req);
     const validationError = validateCreate(input);
@@ -413,29 +374,26 @@ async function handleRequest(req, res) {
     const createdAt = nowIso();
     const scheduledAt = new Date(input.scheduledAt).toISOString();
 
+    db.exec('BEGIN IMMEDIATE');
     try {
-      insertMessage.run(
-        id,
-        clientMessageId,
-        typeof input.session === 'string' && input.session.trim() ? input.session.trim() : 'default',
-        input.chatId.trim(),
-        input.type,
-        JSON.stringify(input.payload),
-        scheduledAt,
-        typeof input.timezone === 'string' && input.timezone.trim() ? input.timezone.trim() : null,
-        createdAt,
-        createdAt
-      );
-    } catch (error) {
-      if (String(error?.message || error).includes('UNIQUE')) {
-        const existing = getByClientIdStmt.get(clientMessageId);
-        return json(res, 200, {
-          ...serializeMessage(existing),
-          idempotentReplay: true
-        });
+      const existing = getByClientIdStmt.get(clientMessageId);
+      if (existing) {
+        db.exec('COMMIT');
+        return json(res, 200, { ...serializeMessage(existing), idempotentReplay: true });
       }
-      throw error;
-    }
+      const payload = canonicalPayload(input.type, input.payload);
+      if (input.type !== 'text') mediaStore.requireBindable(payload.mediaId, input.type);
+      insertMessage.run(id, clientMessageId,
+        typeof input.session === 'string' && input.session.trim() ? input.session.trim() : 'default',
+        input.chatId.trim(), input.type, JSON.stringify(payload), scheduledAt,
+        typeof input.timezone === 'string' && input.timezone.trim() ? input.timezone.trim() : null,
+        createdAt, createdAt);
+      if (input.type !== 'text') {
+        db.prepare('UPDATE media SET bound_message_id = ? WHERE id = ?').run(id, payload.mediaId);
+        db.prepare('UPDATE messages SET media_id = ? WHERE id = ?').run(payload.mediaId, id);
+      }
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
 
     return json(res, 201, serializeMessage(getMessageStmt.get(id)));
   }
@@ -482,6 +440,7 @@ async function handleRequest(req, res) {
       }
 
       const input = await readJson(req);
+      if (!input || typeof input !== 'object' || Array.isArray(input)) return json(res, 400, { error: 'invalid_body' });
       const updates = [];
       const values = [];
 
@@ -505,11 +464,13 @@ async function handleRequest(req, res) {
         values.push(input.session.trim());
       }
       if ('payload' in input) {
-        if (!input.payload || typeof input.payload.text !== 'string' || !input.payload.text.trim()) {
-          return json(res, 400, { error: 'payload_text_required' });
+        const payloadError = validatePayload(current.type, input.payload);
+        if (payloadError) return json(res, 400, { error: payloadError });
+        if (current.type !== 'text' && input.payload.mediaId.trim() !== current.media_id) {
+          return json(res, 409, { error: 'media_rebinding_not_supported' });
         }
         updates.push('payload_json = ?');
-        values.push(JSON.stringify(input.payload));
+        values.push(JSON.stringify(canonicalPayload(current.type, input.payload)));
       }
 
       if (!updates.length) return json(res, 400, { error: 'no_supported_fields_to_update' });
@@ -529,9 +490,9 @@ async function handleRequest(req, res) {
 
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch(error => {
-    console.error('[HTTP] unhandled_error', error);
+    console.error('[HTTP] request_error');
     if (!res.headersSent) {
-      json(res, error?.statusCode || 500, { error: error?.message || 'internal_server_error' });
+      json(res, error?.statusCode || 500, { error: error?.statusCode ? error.message : 'internal_server_error' });
     } else {
       res.destroy();
     }
@@ -539,7 +500,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[skedly-scheduler] listening on http://${HOST}:${PORT}`);
+  console.log(`[skedly-scheduler] listening on http://${HOST}:${server.address().port}`);
   console.log(`[skedly-scheduler] sqlite=${DB_PATH}`);
   console.log(`[skedly-scheduler] deliveryMode=${DELIVERY_MODE}`);
   console.log('[skedly-scheduler] apiAuth=enabled');
@@ -548,14 +509,26 @@ server.listen(PORT, HOST, () => {
   }
 });
 
-setInterval(() => { void runWorker(); }, WORKER_INTERVAL_MS).unref();
-setTimeout(() => { void runWorker(); }, 100).unref();
+function runCleanup() {
+  try { mediaStore.cleanup(); } catch { console.error('[SCHEDULER] cleanup_error'); }
+}
+const cleanupTimer = setInterval(runCleanup, CLEANUP_INTERVAL_MS).unref();
+runCleanup();
+const workerTimer = setInterval(() => { void runWorker(); }, WORKER_INTERVAL_MS).unref();
+const firstWorkerTimer = setTimeout(() => { void runWorker(); }, 100).unref();
 
 function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(workerTimer); clearInterval(cleanupTimer); clearTimeout(firstWorkerTimer);
   console.log(`[skedly-scheduler] shutting_down signal=${signal}`);
   server.close(() => {
-    try { db.close(); } catch {}
-    process.exit(0);
+    const finish = () => {
+      if (workerBusy) return setTimeout(finish, 25);
+      try { db.close(); } catch {}
+      process.exit(0);
+    };
+    finish();
   });
   setTimeout(() => process.exit(1), 5000).unref();
 }

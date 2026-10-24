@@ -1,202 +1,74 @@
-name: Publish Skedly Scheduler image
+name: Test and publish media candidate
 
 on:
   push:
     branches:
       - main
+      - milestone/media
   workflow_dispatch:
 
+# Candidate releases deliberately never update latest or deploy anything.
 permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: skedly-media-publish
+  cancel-in-progress: false
+
 jobs:
   build-test-and-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build image
-        run: |
-          docker build -t skedly-scheduler:test .
+      - name: Build candidate image
+        run: docker build --pull -t skedly-scheduler:test .
 
-      - name: Run Milestone 4 authenticated WAHA integration test
+      - name: Test exact candidate image with M4 and media WAHA mock suite
+        run: docker run --rm --entrypoint node skedly-scheduler:test --no-warnings --test /app/test/scheduler.test.js
+
+      - name: Smoke test production entrypoint and persistent volume
         shell: bash
         run: |
           set -euo pipefail
-
           cleanup() {
-            docker rm -f skedly-test waha-mock >/dev/null 2>&1 || true
-            docker volume rm skedly_test_data >/dev/null 2>&1 || true
-            docker network rm skedly_test_net >/dev/null 2>&1 || true
+            docker rm -f skedly-smoke >/dev/null 2>&1 || true
+            docker volume rm skedly_media_smoke >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
-
-          cat >/tmp/waha-mock.js <<'NODE'
-          const http = require('http');
-          const EXPECTED_KEY = 'test-waha-key';
-          const server = http.createServer((req, res) => {
-            if (req.method !== 'POST' || req.url !== '/api/sendText') {
-              res.writeHead(404);
-              return res.end();
-            }
-            if (req.headers['x-api-key'] !== EXPECTED_KEY) {
-              res.writeHead(401, {'content-type':'application/json'});
-              return res.end(JSON.stringify({error:'bad_key'}));
-            }
-            let body = '';
-            req.on('data', chunk => body += chunk);
-            req.on('end', () => {
-              let data;
-              try { data = JSON.parse(body || '{}'); }
-              catch {
-                res.writeHead(400, {'content-type':'application/json'});
-                return res.end(JSON.stringify({error:'bad_json'}));
-              }
-              if (data.session !== 'default' || data.chatId !== '393331234567@c.us' || data.text !== 'Skedly Milestone 3 integration test') {
-                res.writeHead(400, {'content-type':'application/json'});
-                return res.end(JSON.stringify({error:'bad_body', received:data}));
-              }
-              console.log('MOCK_RECEIVED', JSON.stringify(data));
-              res.writeHead(201, {'content-type':'application/json'});
-              res.end(JSON.stringify({id:'mock-message-id-123'}));
-            });
-          });
-          server.listen(3000, '0.0.0.0', () => console.log('MOCK_READY'));
-          NODE
-
-          docker network create skedly_test_net
-          docker volume create skedly_test_data
-
-          docker run -d \
-            --name waha-mock \
-            --network skedly_test_net \
-            -v /tmp/waha-mock.js:/app/waha-mock.js:ro \
-            node:22-alpine \
-            node /app/waha-mock.js
-
-          docker run -d \
-            --name skedly-test \
-            --network skedly_test_net \
-            -p 127.0.0.1:8080:8080 \
-            -e PORT=8080 \
-            -e DB_PATH=/data/skedly-scheduler.db \
-            -e WORKER_INTERVAL_MS=1000 \
-            -e LEASE_MS=30000 \
-            -e DELIVERY_MODE=waha \
-            -e WAHA_BASE_URL=http://waha-mock:3000 \
-            -e WAHA_API_KEY=test-waha-key \
-            -e WAHA_TIMEOUT_MS=5000 \
-            -e SCHEDULER_API_TOKEN=test-scheduler-token-1234567890 \
-            -v skedly_test_data:/data \
-            skedly-scheduler:test
-
-          echo 'Waiting for /health...'
+          docker volume create skedly_media_smoke
+          docker run -d --name skedly-smoke \
+            -e SCHEDULER_API_TOKEN=ci-smoke-token \
+            -v skedly_media_smoke:/data skedly-scheduler:test
+          ready=false
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8080/health >/tmp/health.json; then
+            if docker exec skedly-smoke node -e '
+              fetch("http://localhost:8080/health").then(async r => {
+                const d = await r.json();
+                process.exit(r.ok && d.apiAuthConfigured && d.db === "ok" ? 0 : 1);
+              }).catch(() => process.exit(1));'; then
+              ready=true
               break
             fi
             sleep 1
           done
-
-          cat /tmp/health.json
-          jq -e '.status == "ok" and .db == "ok" and .deliveryMode == "waha" and .wahaConfigured == true and .apiAuthConfigured == true' /tmp/health.json
-          docker exec skedly-test test -f /data/skedly-scheduler.db
-
-          echo 'Checking API authentication...'
-          UNAUTH_STATUS="$(curl -sS -o /tmp/unauthorized.json -w '%{http_code}' http://127.0.0.1:8080/status)"
-          test "${UNAUTH_STATUS}" = '401'
-          jq -e '.error == "unauthorized"' /tmp/unauthorized.json
-
-          SCHEDULED_AT="$(date -u -d '+45 seconds' '+%Y-%m-%dT%H:%M:%SZ')"
-          CLIENT_ID="github-actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-          CREATE_RESPONSE="$(
-            curl -fsS \
-              -X POST \
-              -H 'Content-Type: application/json' \
-              -H 'Authorization: Bearer test-scheduler-token-1234567890' \
-              -d "{
-                \"clientMessageId\": \"${CLIENT_ID}\",
-                \"session\": \"default\",
-                \"chatId\": \"393331234567@c.us\",
-                \"type\": \"text\",
-                \"payload\": {\"text\": \"Skedly Milestone 3 integration test\"},
-                \"scheduledAt\": \"${SCHEDULED_AT}\",
-                \"timezone\": \"UTC\"
-              }" \
-              http://127.0.0.1:8080/v1/messages
-          )"
-
-          echo "${CREATE_RESPONSE}" | jq .
-          MESSAGE_ID="$(echo "${CREATE_RESPONSE}" | jq -r '.id')"
-          echo "${CREATE_RESPONSE}" | jq -e '.status == "pending"'
-
-          REPLAY_RESPONSE="$(
-            curl -fsS \
-              -X POST \
-              -H 'Content-Type: application/json' \
-              -H 'Authorization: Bearer test-scheduler-token-1234567890' \
-              -d "{
-                \"clientMessageId\": \"${CLIENT_ID}\",
-                \"session\": \"default\",
-                \"chatId\": \"393331234567@c.us\",
-                \"type\": \"text\",
-                \"payload\": {\"text\": \"Skedly Milestone 3 integration test\"},
-                \"scheduledAt\": \"${SCHEDULED_AT}\",
-                \"timezone\": \"UTC\"
-              }" \
-              http://127.0.0.1:8080/v1/messages
-          )"
-          echo "${REPLAY_RESPONSE}" | jq -e --arg id "${MESSAGE_ID}" '.id == $id and .idempotentReplay == true'
-
-          echo 'Restarting scheduler before scheduledAt...'
-          docker restart skedly-test
-
+          test "$ready" = true
+          docker exec skedly-smoke test -d /data/media
+          docker exec skedly-smoke test -f /data/skedly-scheduler.db
+          docker restart skedly-smoke
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+            if docker exec skedly-smoke node -e '
+              fetch("http://localhost:8080/status").then(r => process.exit(r.status === 401 ? 0 : 1)).catch(() => process.exit(1));'; then
               break
             fi
             sleep 1
           done
-
-          AFTER_RESTART="$(curl -fsS -H "Authorization: Bearer test-scheduler-token-1234567890" "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
-          echo "${AFTER_RESTART}" | jq .
-          echo "${AFTER_RESTART}" | jq -e '.status == "pending"'
-          docker exec skedly-test test -f /data/skedly-scheduler.db
-
-          echo 'Waiting for scheduled WAHA delivery...'
-          FINAL_STATUS=''
-          for i in $(seq 1 75); do
-            CURRENT="$(curl -fsS -H "Authorization: Bearer test-scheduler-token-1234567890" "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
-            FINAL_STATUS="$(echo "${CURRENT}" | jq -r '.status')"
-
-            if [ "${FINAL_STATUS}" = 'sent' ]; then
-              echo "${CURRENT}" | jq .
-              echo "${CURRENT}" | jq -e '.wahaMessageId == "mock-message-id-123"'
-              break
-            fi
-
-            if [ "${FINAL_STATUS}" = 'failed' ] || [ "${FINAL_STATUS}" = 'unknown' ]; then
-              echo "${CURRENT}" | jq .
-              exit 1
-            fi
-
-            sleep 1
-          done
-
-          test "${FINAL_STATUS}" = 'sent'
-
-          docker logs waha-mock 2>&1 | tee /tmp/waha-mock.log
-          grep -F 'MOCK_RECEIVED {"session":"default","chatId":"393331234567@c.us","text":"Skedly Milestone 3 integration test"}' /tmp/waha-mock.log
-
-          docker logs skedly-test 2>&1 | tee /tmp/skedly-test.log
-          grep -F "[SCHEDULER] sent-waha id=${MESSAGE_ID}" /tmp/skedly-test.log
-
-          echo 'Milestone 4 authenticated WAHA integration test PASSED'
+          docker exec skedly-smoke node -e '
+            fetch("http://localhost:8080/status", {headers:{Authorization:"Bearer ci-smoke-token"}})
+              .then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1));'
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -205,9 +77,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Tag and push tested image
+      - name: Publish only tested media candidate and immutable commit tag
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          docker tag skedly-scheduler:test ghcr.io/sam97s/skedly-scheduler:latest
-          docker tag skedly-scheduler:test ghcr.io/sam97s/skedly-scheduler:${{ github.sha }}
-          docker push ghcr.io/sam97s/skedly-scheduler:latest
-          docker push ghcr.io/sam97s/skedly-scheduler:${{ github.sha }}
+          set -euo pipefail
+          image=ghcr.io/sam97s/skedly-scheduler
+          docker tag skedly-scheduler:test "$image:media"
+          docker tag skedly-scheduler:test "$image:media-$COMMIT_SHA"
+          docker push "$image:media-$COMMIT_SHA"
+          docker push "$image:media"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' skedly-scheduler:test)"
+          {
+            echo '## Validated media candidate'
+            echo "Tag: $image:media"
+            echo "Commit tag: $image:media-$COMMIT_SHA"
+            echo "Digest: $digest"
+            echo 'All tests and entrypoint/volume smoke checks passed. No latest update. No VPS deployment.'
+          } >> "$GITHUB_STEP_SUMMARY"

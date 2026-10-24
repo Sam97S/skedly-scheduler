@@ -1,0 +1,7 @@
+.git
+.codex
+node_modules
+*.db
+*.db-shm
+*.db-wal
+*.log
