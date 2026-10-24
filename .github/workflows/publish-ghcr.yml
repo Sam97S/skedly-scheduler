@@ -28,7 +28,7 @@ jobs:
         run: docker build --pull -t skedly-scheduler:test .
 
       - name: Test exact candidate image with M4 and media WAHA mock suite
-        run: docker run --rm --entrypoint node skedly-scheduler:test --no-warnings --test /app/test/scheduler.test.js
+        run: docker run --rm --entrypoint sh skedly-scheduler:test -lc 'node --no-warnings --test /app/test/*.test.js'
 
       - name: Smoke test production entrypoint and persistent volume
         shell: bash
