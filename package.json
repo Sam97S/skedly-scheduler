@@ -1,0 +1,7 @@
+{
+  "name": "skedly-scheduler",
+  "version": "0.5.0",
+  "private": true,
+  "engines": { "node": ">=22.13.0" },
+  "scripts": { "test": "node --no-warnings --test test/*.test.js" }
+}
