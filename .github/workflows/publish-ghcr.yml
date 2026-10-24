@@ -23,7 +23,7 @@ jobs:
         run: |
           docker build -t skedly-scheduler:test .
 
-      - name: Run Milestone 3 WAHA integration test
+      - name: Run Milestone 4 authenticated WAHA integration test
         shell: bash
         run: |
           set -euo pipefail
@@ -90,6 +90,7 @@ jobs:
             -e WAHA_BASE_URL=http://waha-mock:3000 \
             -e WAHA_API_KEY=test-waha-key \
             -e WAHA_TIMEOUT_MS=5000 \
+            -e SCHEDULER_API_TOKEN=test-scheduler-token-1234567890 \
             -v skedly_test_data:/data \
             skedly-scheduler:test
 
@@ -102,8 +103,13 @@ jobs:
           done
 
           cat /tmp/health.json
-          jq -e '.status == "ok" and .db == "ok" and .deliveryMode == "waha" and .wahaConfigured == true' /tmp/health.json
+          jq -e '.status == "ok" and .db == "ok" and .deliveryMode == "waha" and .wahaConfigured == true and .apiAuthConfigured == true' /tmp/health.json
           docker exec skedly-test test -f /data/skedly-scheduler.db
+
+          echo 'Checking API authentication...'
+          UNAUTH_STATUS="$(curl -sS -o /tmp/unauthorized.json -w '%{http_code}' http://127.0.0.1:8080/status)"
+          test "${UNAUTH_STATUS}" = '401'
+          jq -e '.error == "unauthorized"' /tmp/unauthorized.json
 
           SCHEDULED_AT="$(date -u -d '+45 seconds' '+%Y-%m-%dT%H:%M:%SZ')"
           CLIENT_ID="github-actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -112,6 +118,7 @@ jobs:
             curl -fsS \
               -X POST \
               -H 'Content-Type: application/json' \
+              -H 'Authorization: Bearer test-scheduler-token-1234567890' \
               -d "{
                 \"clientMessageId\": \"${CLIENT_ID}\",
                 \"session\": \"default\",
@@ -132,6 +139,7 @@ jobs:
             curl -fsS \
               -X POST \
               -H 'Content-Type: application/json' \
+              -H 'Authorization: Bearer test-scheduler-token-1234567890' \
               -d "{
                 \"clientMessageId\": \"${CLIENT_ID}\",
                 \"session\": \"default\",
@@ -155,7 +163,7 @@ jobs:
             sleep 1
           done
 
-          AFTER_RESTART="$(curl -fsS "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
+          AFTER_RESTART="$(curl -fsS -H "Authorization: Bearer test-scheduler-token-1234567890" "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
           echo "${AFTER_RESTART}" | jq .
           echo "${AFTER_RESTART}" | jq -e '.status == "pending"'
           docker exec skedly-test test -f /data/skedly-scheduler.db
@@ -163,7 +171,7 @@ jobs:
           echo 'Waiting for scheduled WAHA delivery...'
           FINAL_STATUS=''
           for i in $(seq 1 75); do
-            CURRENT="$(curl -fsS "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
+            CURRENT="$(curl -fsS -H "Authorization: Bearer test-scheduler-token-1234567890" "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
             FINAL_STATUS="$(echo "${CURRENT}" | jq -r '.status')"
 
             if [ "${FINAL_STATUS}" = 'sent' ]; then
@@ -188,7 +196,7 @@ jobs:
           docker logs skedly-test 2>&1 | tee /tmp/skedly-test.log
           grep -F "[SCHEDULER] sent-waha id=${MESSAGE_ID}" /tmp/skedly-test.log
 
-          echo 'Milestone 3 WAHA integration test PASSED'
+          echo 'Milestone 4 authenticated WAHA integration test PASSED'
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
