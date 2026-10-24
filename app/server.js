@@ -103,9 +103,9 @@ const markUnknownStmt = db.prepare(`
   SET status = 'unknown', lease_until = NULL, updated_at = ?, last_error = ?
   WHERE id = ? AND status = 'processing' AND lease_token = ?
 `);
-const resumeConfirmedVoiceStmt = db.prepare(`
+const resumeConfirmedMediaStmt = db.prepare(`
   UPDATE messages SET status = 'pending', lease_until = NULL, lease_token = NULL, updated_at = ?
-  WHERE status = 'processing' AND lease_until < ? AND type = 'voice'
+  WHERE status = 'processing' AND lease_until < ? AND type IN ('image','file','voice')
     AND media_sent_at IS NOT NULL AND delivery_started_at IS NULL
 `);
 const recoverExpiredStmt = db.prepare(`
@@ -280,7 +280,7 @@ async function runWorker() {
   workerBusy = true;
   try {
     const now = nowIso();
-    resumeConfirmedVoiceStmt.run(now, now);
+    resumeConfirmedMediaStmt.run(now, now);
     const recovered = recoverExpiredStmt.run(now, now);
     if (recovered.changes > 0) {
       console.warn(`[SCHEDULER] recovered_expired_leases_to_unknown count=${recovered.changes}`);
@@ -305,7 +305,6 @@ async function runWorker() {
     workerBusy = false;
   }
 }
-
 
 function safeTokenEqual(a, b) {
   const left = Buffer.from(String(a || ''), 'utf8');
