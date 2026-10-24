@@ -11,6 +11,18 @@ const WORKER_INTERVAL_MS = Math.max(250, Number(process.env.WORKER_INTERVAL_MS |
 const LEASE_MS = Math.max(5000, Number(process.env.LEASE_MS || 30000));
 const MAX_BODY_BYTES = 1024 * 1024;
 
+const DELIVERY_MODE = String(process.env.DELIVERY_MODE || 'local').trim().toLowerCase();
+const WAHA_BASE_URL = String(process.env.WAHA_BASE_URL || 'http://waha:3000').replace(/\/+$/, '');
+const WAHA_API_KEY = String(process.env.WAHA_API_KEY || '');
+const WAHA_TIMEOUT_MS = Math.max(1000, Number(process.env.WAHA_TIMEOUT_MS || 15000));
+
+if (!['local', 'waha'].includes(DELIVERY_MODE)) {
+  throw new Error(`unsupported_DELIVERY_MODE:${DELIVERY_MODE}`);
+}
+if (DELIVERY_MODE === 'waha' && !WAHA_API_KEY) {
+  throw new Error('WAHA_API_KEY_required_when_DELIVERY_MODE_is_waha');
+}
+
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 const db = new DatabaseSync(DB_PATH);
@@ -70,7 +82,7 @@ const claimMessageStmt = db.prepare(`
 `);
 const markSentStmt = db.prepare(`
   UPDATE messages
-  SET status = 'sent', sent_at = ?, lease_until = NULL, updated_at = ?, last_error = NULL
+  SET status = 'sent', sent_at = ?, lease_until = NULL, updated_at = ?, waha_message_id = ?, last_error = NULL
   WHERE id = ? AND status = 'processing'
 `);
 const markFailedStmt = db.prepare(`
@@ -78,9 +90,14 @@ const markFailedStmt = db.prepare(`
   SET status = 'failed', lease_until = NULL, updated_at = ?, last_error = ?
   WHERE id = ? AND status = 'processing'
 `);
+const markUnknownStmt = db.prepare(`
+  UPDATE messages
+  SET status = 'unknown', lease_until = NULL, updated_at = ?, last_error = ?
+  WHERE id = ? AND status = 'processing'
+`);
 const recoverExpiredStmt = db.prepare(`
   UPDATE messages
-  SET status = 'pending', lease_until = NULL, updated_at = ?, last_error = 'lease_expired_recovered'
+  SET status = 'unknown', lease_until = NULL, updated_at = ?, last_error = 'lease_expired_after_processing_delivery_state_ambiguous'
   WHERE status = 'processing' AND lease_until IS NOT NULL AND lease_until < ?
 `);
 
@@ -204,30 +221,110 @@ function claimNextDueMessage() {
   return id ? serializeMessage(getMessageStmt.get(id)) : null;
 }
 
-function executeLocally(message) {
-  const text = message?.payload?.text || '';
-  console.log(`[SCHEDULER] executing id=${message.id} clientMessageId=${message.clientMessageId} chatId=${message.chatId} text=${JSON.stringify(text)}`);
+function extractWahaMessageId(data) {
+  if (!data || typeof data !== 'object') return null;
+  const candidates = [
+    data.id,
+    data?.key?.id,
+    data?._data?.id,
+    data?.message?.id
+  ];
+  const found = candidates.find(value => typeof value === 'string' && value.trim());
+  return found || null;
+}
 
-  // Milestone 2 intentionally performs no WAHA call.
-  // Reaching this point proves persistence + due-time execution + state transitions.
-  const now = nowIso();
-  const result = markSentStmt.run(now, now, message.id);
-  if (result.changes !== 1) {
-    throw new Error(`unable_to_mark_sent:${message.id}`);
+async function sendTextViaWaha(message) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), WAHA_TIMEOUT_MS);
+  const url = `${WAHA_BASE_URL}/api/sendText`;
+  const body = {
+    session: message.session || 'default',
+    chatId: message.chatId,
+    text: message?.payload?.text || ''
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'X-Api-Key': WAHA_API_KEY
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+
+    const raw = await response.text();
+    let data = null;
+    if (raw) {
+      try { data = JSON.parse(raw); } catch { data = { raw }; }
+    }
+
+    if (response.ok) {
+      return {
+        outcome: 'sent',
+        wahaMessageId: extractWahaMessageId(data),
+        httpStatus: response.status
+      };
+    }
+
+    const detail = `waha_http_${response.status}${raw ? `:${raw.slice(0, 500)}` : ''}`;
+    if (response.status >= 500) {
+      return { outcome: 'unknown', error: detail, httpStatus: response.status };
+    }
+    return { outcome: 'failed', error: detail, httpStatus: response.status };
+  } catch (error) {
+    const reason = error?.name === 'AbortError'
+      ? `waha_timeout_after_${WAHA_TIMEOUT_MS}ms`
+      : `waha_transport_error:${String(error?.message || error)}`;
+    return { outcome: 'unknown', error: reason, httpStatus: null };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function executeMessage(message) {
+  const text = message?.payload?.text || '';
+  console.log(`[SCHEDULER] executing id=${message.id} clientMessageId=${message.clientMessageId} chatId=${message.chatId} mode=${DELIVERY_MODE} text=${JSON.stringify(text)}`);
+
+  if (DELIVERY_MODE === 'local') {
+    const now = nowIso();
+    const result = markSentStmt.run(now, now, null, message.id);
+    if (result.changes !== 1) throw new Error(`unable_to_mark_sent:${message.id}`);
+    console.log(`[SCHEDULER] sent-local id=${message.id} at=${now}`);
+    return;
   }
 
-  console.log(`[SCHEDULER] sent-local id=${message.id} at=${now}`);
+  const delivery = await sendTextViaWaha(message);
+  const completedAt = nowIso();
+
+  if (delivery.outcome === 'sent') {
+    const result = markSentStmt.run(completedAt, completedAt, delivery.wahaMessageId, message.id);
+    if (result.changes !== 1) throw new Error(`unable_to_mark_sent:${message.id}`);
+    console.log(`[SCHEDULER] sent-waha id=${message.id} httpStatus=${delivery.httpStatus} wahaMessageId=${delivery.wahaMessageId || 'none'} at=${completedAt}`);
+    return;
+  }
+
+  if (delivery.outcome === 'failed') {
+    markFailedStmt.run(completedAt, delivery.error, message.id);
+    console.error(`[SCHEDULER] failed-waha id=${message.id} httpStatus=${delivery.httpStatus} error=${delivery.error}`);
+    return;
+  }
+
+  markUnknownStmt.run(completedAt, delivery.error, message.id);
+  console.error(`[SCHEDULER] unknown-waha id=${message.id} httpStatus=${delivery.httpStatus ?? 'none'} error=${delivery.error}`);
 }
 
 let workerBusy = false;
-function runWorker() {
+async function runWorker() {
   if (workerBusy) return;
   workerBusy = true;
   try {
     const now = nowIso();
     const recovered = recoverExpiredStmt.run(now, now);
     if (recovered.changes > 0) {
-      console.log(`[SCHEDULER] recovered_expired_leases count=${recovered.changes}`);
+      console.warn(`[SCHEDULER] recovered_expired_leases_to_unknown count=${recovered.changes}`);
     }
 
     for (let i = 0; i < 20; i += 1) {
@@ -235,11 +332,11 @@ function runWorker() {
       if (!message) break;
 
       try {
-        executeLocally(message);
+        await executeMessage(message);
       } catch (error) {
         const failedAt = nowIso();
-        markFailedStmt.run(failedAt, String(error?.message || error), message.id);
-        console.error(`[SCHEDULER] failed id=${message.id}`, error);
+        markUnknownStmt.run(failedAt, `scheduler_execution_error:${String(error?.message || error)}`, message.id);
+        console.error(`[SCHEDULER] execution_error_to_unknown id=${message.id}`, error);
       }
     }
   } catch (error) {
@@ -258,16 +355,21 @@ async function handleRequest(req, res) {
       status: 'ok',
       service: 'skedly-scheduler',
       db: 'ok',
-      worker: workerBusy ? 'busy' : 'idle'
+      worker: workerBusy ? 'busy' : 'idle',
+      deliveryMode: DELIVERY_MODE,
+      wahaConfigured: DELIVERY_MODE === 'waha' ? Boolean(WAHA_BASE_URL && WAHA_API_KEY) : null
     });
   }
 
   if (req.method === 'GET' && pathname === '/status') {
     return json(res, 200, {
       service: 'skedly-scheduler',
-      mode: 'local-dry-run',
+      mode: DELIVERY_MODE,
       databasePath: DB_PATH,
       workerIntervalMs: WORKER_INTERVAL_MS,
+      leaseMs: LEASE_MS,
+      wahaBaseUrl: DELIVERY_MODE === 'waha' ? WAHA_BASE_URL : null,
+      wahaTimeoutMs: DELIVERY_MODE === 'waha' ? WAHA_TIMEOUT_MS : null,
       counts: statusSummary(),
       now: nowIso()
     });
@@ -299,9 +401,9 @@ async function handleRequest(req, res) {
     } catch (error) {
       if (String(error?.message || error).includes('UNIQUE')) {
         const existing = getByClientIdStmt.get(clientMessageId);
-        return json(res, 409, {
-          error: 'duplicate_clientMessageId',
-          existing: serializeMessage(existing)
+        return json(res, 200, {
+          ...serializeMessage(existing),
+          idempotentReplay: true
         });
       }
       throw error;
@@ -411,11 +513,14 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`[skedly-scheduler] listening on http://${HOST}:${PORT}`);
   console.log(`[skedly-scheduler] sqlite=${DB_PATH}`);
-  console.log('[skedly-scheduler] mode=local-dry-run');
+  console.log(`[skedly-scheduler] deliveryMode=${DELIVERY_MODE}`);
+  if (DELIVERY_MODE === 'waha') {
+    console.log(`[skedly-scheduler] wahaBaseUrl=${WAHA_BASE_URL}`);
+  }
 });
 
-setInterval(runWorker, WORKER_INTERVAL_MS).unref();
-setTimeout(runWorker, 100).unref();
+setInterval(() => { void runWorker(); }, WORKER_INTERVAL_MS).unref();
+setTimeout(() => { void runWorker(); }, 100).unref();
 
 function shutdown(signal) {
   console.log(`[skedly-scheduler] shutting_down signal=${signal}`);
