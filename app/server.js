@@ -1,7 +1,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { randomUUID, timingSafeEqual } = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
 
 const HOST = '0.0.0.0';
@@ -15,12 +15,16 @@ const DELIVERY_MODE = String(process.env.DELIVERY_MODE || 'local').trim().toLowe
 const WAHA_BASE_URL = String(process.env.WAHA_BASE_URL || 'http://waha:3000').replace(/\/+$/, '');
 const WAHA_API_KEY = String(process.env.WAHA_API_KEY || '');
 const WAHA_TIMEOUT_MS = Math.max(1000, Number(process.env.WAHA_TIMEOUT_MS || 15000));
+const SCHEDULER_API_TOKEN = String(process.env.SCHEDULER_API_TOKEN || '');
 
 if (!['local', 'waha'].includes(DELIVERY_MODE)) {
   throw new Error(`unsupported_DELIVERY_MODE:${DELIVERY_MODE}`);
 }
 if (DELIVERY_MODE === 'waha' && !WAHA_API_KEY) {
   throw new Error('WAHA_API_KEY_required_when_DELIVERY_MODE_is_waha');
+}
+if (!SCHEDULER_API_TOKEN) {
+  throw new Error('SCHEDULER_API_TOKEN_required');
 }
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -346,6 +350,27 @@ async function runWorker() {
   }
 }
 
+
+function safeTokenEqual(a, b) {
+  const left = Buffer.from(String(a || ''), 'utf8');
+  const right = Buffer.from(String(b || ''), 'utf8');
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+function isApiAuthorized(req) {
+  const header = String(req.headers.authorization || '');
+  if (!header.startsWith('Bearer ')) return false;
+  const token = header.slice(7).trim();
+  return Boolean(token) && safeTokenEqual(token, SCHEDULER_API_TOKEN);
+}
+
+function requireApiAuth(req, res) {
+  if (isApiAuthorized(req)) return true;
+  json(res, 401, { error: 'unauthorized' });
+  return false;
+}
+
 async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
@@ -357,9 +382,12 @@ async function handleRequest(req, res) {
       db: 'ok',
       worker: workerBusy ? 'busy' : 'idle',
       deliveryMode: DELIVERY_MODE,
-      wahaConfigured: DELIVERY_MODE === 'waha' ? Boolean(WAHA_BASE_URL && WAHA_API_KEY) : null
+      wahaConfigured: DELIVERY_MODE === 'waha' ? Boolean(WAHA_BASE_URL && WAHA_API_KEY) : null,
+      apiAuthConfigured: Boolean(SCHEDULER_API_TOKEN)
     });
   }
+
+  if (!requireApiAuth(req, res)) return;
 
   if (req.method === 'GET' && pathname === '/status') {
     return json(res, 200, {
@@ -514,6 +542,7 @@ server.listen(PORT, HOST, () => {
   console.log(`[skedly-scheduler] listening on http://${HOST}:${PORT}`);
   console.log(`[skedly-scheduler] sqlite=${DB_PATH}`);
   console.log(`[skedly-scheduler] deliveryMode=${DELIVERY_MODE}`);
+  console.log('[skedly-scheduler] apiAuth=enabled');
   if (DELIVERY_MODE === 'waha') {
     console.log(`[skedly-scheduler] wahaBaseUrl=${WAHA_BASE_URL}`);
   }
