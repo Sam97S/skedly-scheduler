@@ -13,7 +13,7 @@ permissions:
 jobs:
   build-test-and-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout repository
@@ -23,30 +23,77 @@ jobs:
         run: |
           docker build -t skedly-scheduler:test .
 
-      - name: Run Milestone 2 integration test
+      - name: Run Milestone 3 WAHA integration test
         shell: bash
         run: |
           set -euo pipefail
 
           cleanup() {
-            docker rm -f skedly-test >/dev/null 2>&1 || true
+            docker rm -f skedly-test waha-mock >/dev/null 2>&1 || true
             docker volume rm skedly_test_data >/dev/null 2>&1 || true
+            docker network rm skedly_test_net >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
+          cat >/tmp/waha-mock.js <<'NODE'
+          const http = require('http');
+          const EXPECTED_KEY = 'test-waha-key';
+          const server = http.createServer((req, res) => {
+            if (req.method !== 'POST' || req.url !== '/api/sendText') {
+              res.writeHead(404);
+              return res.end();
+            }
+            if (req.headers['x-api-key'] !== EXPECTED_KEY) {
+              res.writeHead(401, {'content-type':'application/json'});
+              return res.end(JSON.stringify({error:'bad_key'}));
+            }
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', () => {
+              let data;
+              try { data = JSON.parse(body || '{}'); }
+              catch {
+                res.writeHead(400, {'content-type':'application/json'});
+                return res.end(JSON.stringify({error:'bad_json'}));
+              }
+              if (data.session !== 'default' || data.chatId !== '393331234567@c.us' || data.text !== 'Skedly Milestone 3 integration test') {
+                res.writeHead(400, {'content-type':'application/json'});
+                return res.end(JSON.stringify({error:'bad_body', received:data}));
+              }
+              console.log('MOCK_RECEIVED', JSON.stringify(data));
+              res.writeHead(201, {'content-type':'application/json'});
+              res.end(JSON.stringify({id:'mock-message-id-123'}));
+            });
+          });
+          server.listen(3000, '0.0.0.0', () => console.log('MOCK_READY'));
+          NODE
+
+          docker network create skedly_test_net
           docker volume create skedly_test_data
 
           docker run -d \
+            --name waha-mock \
+            --network skedly_test_net \
+            -v /tmp/waha-mock.js:/app/waha-mock.js:ro \
+            node:22-alpine \
+            node /app/waha-mock.js
+
+          docker run -d \
             --name skedly-test \
+            --network skedly_test_net \
             -p 127.0.0.1:8080:8080 \
             -e PORT=8080 \
             -e DB_PATH=/data/skedly-scheduler.db \
             -e WORKER_INTERVAL_MS=1000 \
             -e LEASE_MS=30000 \
+            -e DELIVERY_MODE=waha \
+            -e WAHA_BASE_URL=http://waha-mock:3000 \
+            -e WAHA_API_KEY=test-waha-key \
+            -e WAHA_TIMEOUT_MS=5000 \
             -v skedly_test_data:/data \
             skedly-scheduler:test
 
-          echo "Waiting for /health..."
+          echo 'Waiting for /health...'
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8080/health >/tmp/health.json; then
               break
@@ -55,24 +102,22 @@ jobs:
           done
 
           cat /tmp/health.json
-          jq -e '.status == "ok" and .db == "ok"' /tmp/health.json
-
-          echo "Checking SQLite database file..."
+          jq -e '.status == "ok" and .db == "ok" and .deliveryMode == "waha" and .wahaConfigured == true' /tmp/health.json
           docker exec skedly-test test -f /data/skedly-scheduler.db
 
           SCHEDULED_AT="$(date -u -d '+45 seconds' '+%Y-%m-%dT%H:%M:%SZ')"
+          CLIENT_ID="github-actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-          echo "Creating scheduled test message for ${SCHEDULED_AT}"
           CREATE_RESPONSE="$(
             curl -fsS \
               -X POST \
               -H 'Content-Type: application/json' \
               -d "{
-                \"clientMessageId\": \"github-actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
+                \"clientMessageId\": \"${CLIENT_ID}\",
                 \"session\": \"default\",
                 \"chatId\": \"393331234567@c.us\",
                 \"type\": \"text\",
-                \"payload\": {\"text\": \"Skedly Milestone 2 integration test\"},
+                \"payload\": {\"text\": \"Skedly Milestone 3 integration test\"},
                 \"scheduledAt\": \"${SCHEDULED_AT}\",
                 \"timezone\": \"UTC\"
               }" \
@@ -81,14 +126,28 @@ jobs:
 
           echo "${CREATE_RESPONSE}" | jq .
           MESSAGE_ID="$(echo "${CREATE_RESPONSE}" | jq -r '.id')"
-          test -n "${MESSAGE_ID}"
-          test "${MESSAGE_ID}" != "null"
           echo "${CREATE_RESPONSE}" | jq -e '.status == "pending"'
 
-          echo "Restarting scheduler before scheduledAt..."
+          REPLAY_RESPONSE="$(
+            curl -fsS \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"clientMessageId\": \"${CLIENT_ID}\",
+                \"session\": \"default\",
+                \"chatId\": \"393331234567@c.us\",
+                \"type\": \"text\",
+                \"payload\": {\"text\": \"Skedly Milestone 3 integration test\"},
+                \"scheduledAt\": \"${SCHEDULED_AT}\",
+                \"timezone\": \"UTC\"
+              }" \
+              http://127.0.0.1:8080/v1/messages
+          )"
+          echo "${REPLAY_RESPONSE}" | jq -e --arg id "${MESSAGE_ID}" '.id == $id and .idempotentReplay == true'
+
+          echo 'Restarting scheduler before scheduledAt...'
           docker restart skedly-test
 
-          echo "Waiting for scheduler after restart..."
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
               break
@@ -96,39 +155,40 @@ jobs:
             sleep 1
           done
 
-          echo "Checking persistence after restart..."
           AFTER_RESTART="$(curl -fsS "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
           echo "${AFTER_RESTART}" | jq .
           echo "${AFTER_RESTART}" | jq -e '.status == "pending"'
           docker exec skedly-test test -f /data/skedly-scheduler.db
 
-          echo "Waiting for worker to execute scheduled message..."
-          FINAL_STATUS=""
+          echo 'Waiting for scheduled WAHA delivery...'
+          FINAL_STATUS=''
           for i in $(seq 1 75); do
             CURRENT="$(curl -fsS "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
             FINAL_STATUS="$(echo "${CURRENT}" | jq -r '.status')"
 
-            if [ "${FINAL_STATUS}" = "sent" ]; then
+            if [ "${FINAL_STATUS}" = 'sent' ]; then
               echo "${CURRENT}" | jq .
+              echo "${CURRENT}" | jq -e '.wahaMessageId == "mock-message-id-123"'
               break
             fi
 
-            if [ "${FINAL_STATUS}" = "failed" ] || [ "${FINAL_STATUS}" = "unknown" ]; then
+            if [ "${FINAL_STATUS}" = 'failed' ] || [ "${FINAL_STATUS}" = 'unknown' ]; then
               echo "${CURRENT}" | jq .
-              echo "Unexpected terminal state: ${FINAL_STATUS}"
               exit 1
             fi
 
             sleep 1
           done
 
-          test "${FINAL_STATUS}" = "sent"
+          test "${FINAL_STATUS}" = 'sent'
 
-          echo "Checking scheduler execution log..."
+          docker logs waha-mock 2>&1 | tee /tmp/waha-mock.log
+          grep -F 'MOCK_RECEIVED {"session":"default","chatId":"393331234567@c.us","text":"Skedly Milestone 3 integration test"}' /tmp/waha-mock.log
+
           docker logs skedly-test 2>&1 | tee /tmp/skedly-test.log
-          grep -F "[SCHEDULER] sent-local id=${MESSAGE_ID}" /tmp/skedly-test.log
+          grep -F "[SCHEDULER] sent-waha id=${MESSAGE_ID}" /tmp/skedly-test.log
 
-          echo "Milestone 2 integration test PASSED"
+          echo 'Milestone 3 WAHA integration test PASSED'
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
