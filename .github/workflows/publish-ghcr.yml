@@ -11,15 +11,124 @@ permissions:
   packages: write
 
 jobs:
-  build-and-push:
+  build-test-and-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: |
+          docker build -t skedly-scheduler:test .
+
+      - name: Run Milestone 2 integration test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            docker rm -f skedly-test >/dev/null 2>&1 || true
+            docker volume rm skedly_test_data >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker volume create skedly_test_data
+
+          docker run -d \
+            --name skedly-test \
+            -p 127.0.0.1:8080:8080 \
+            -e PORT=8080 \
+            -e DB_PATH=/data/skedly-scheduler.db \
+            -e WORKER_INTERVAL_MS=1000 \
+            -e LEASE_MS=30000 \
+            -v skedly_test_data:/data \
+            skedly-scheduler:test
+
+          echo "Waiting for /health..."
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health >/tmp/health.json; then
+              break
+            fi
+            sleep 1
+          done
+
+          cat /tmp/health.json
+          jq -e '.status == "ok" and .db == "ok"' /tmp/health.json
+
+          echo "Checking SQLite database file..."
+          docker exec skedly-test test -f /data/skedly-scheduler.db
+
+          SCHEDULED_AT="$(date -u -d '+45 seconds' '+%Y-%m-%dT%H:%M:%SZ')"
+
+          echo "Creating scheduled test message for ${SCHEDULED_AT}"
+          CREATE_RESPONSE="$(
+            curl -fsS \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"clientMessageId\": \"github-actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",
+                \"session\": \"default\",
+                \"chatId\": \"393331234567@c.us\",
+                \"type\": \"text\",
+                \"payload\": {\"text\": \"Skedly Milestone 2 integration test\"},
+                \"scheduledAt\": \"${SCHEDULED_AT}\",
+                \"timezone\": \"UTC\"
+              }" \
+              http://127.0.0.1:8080/v1/messages
+          )"
+
+          echo "${CREATE_RESPONSE}" | jq .
+          MESSAGE_ID="$(echo "${CREATE_RESPONSE}" | jq -r '.id')"
+          test -n "${MESSAGE_ID}"
+          test "${MESSAGE_ID}" != "null"
+          echo "${CREATE_RESPONSE}" | jq -e '.status == "pending"'
+
+          echo "Restarting scheduler before scheduledAt..."
+          docker restart skedly-test
+
+          echo "Waiting for scheduler after restart..."
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Checking persistence after restart..."
+          AFTER_RESTART="$(curl -fsS "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
+          echo "${AFTER_RESTART}" | jq .
+          echo "${AFTER_RESTART}" | jq -e '.status == "pending"'
+          docker exec skedly-test test -f /data/skedly-scheduler.db
+
+          echo "Waiting for worker to execute scheduled message..."
+          FINAL_STATUS=""
+          for i in $(seq 1 75); do
+            CURRENT="$(curl -fsS "http://127.0.0.1:8080/v1/messages/${MESSAGE_ID}")"
+            FINAL_STATUS="$(echo "${CURRENT}" | jq -r '.status')"
+
+            if [ "${FINAL_STATUS}" = "sent" ]; then
+              echo "${CURRENT}" | jq .
+              break
+            fi
+
+            if [ "${FINAL_STATUS}" = "failed" ] || [ "${FINAL_STATUS}" = "unknown" ]; then
+              echo "${CURRENT}" | jq .
+              echo "Unexpected terminal state: ${FINAL_STATUS}"
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          test "${FINAL_STATUS}" = "sent"
+
+          echo "Checking scheduler execution log..."
+          docker logs skedly-test 2>&1 | tee /tmp/skedly-test.log
+          grep -F "[SCHEDULER] sent-local id=${MESSAGE_ID}" /tmp/skedly-test.log
+
+          echo "Milestone 2 integration test PASSED"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -28,12 +137,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: |
-            ghcr.io/sam97s/skedly-scheduler:latest
-            ghcr.io/sam97s/skedly-scheduler:${{ github.sha }}
+      - name: Tag and push tested image
+        run: |
+          docker tag skedly-scheduler:test ghcr.io/sam97s/skedly-scheduler:latest
+          docker tag skedly-scheduler:test ghcr.io/sam97s/skedly-scheduler:${{ github.sha }}
+          docker push ghcr.io/sam97s/skedly-scheduler:latest
+          docker push ghcr.io/sam97s/skedly-scheduler:${{ github.sha }}
