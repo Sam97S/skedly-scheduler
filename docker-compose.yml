@@ -1,14 +1,16 @@
 services:
   skedly-scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: skedly-scheduler
+    image: ghcr.io/sam97s/skedly-scheduler:latest
     restart: unless-stopped
     environment:
       PORT: "8080"
+      DB_PATH: "/data/skedly-scheduler.db"
+      WORKER_INTERVAL_MS: "1000"
+      LEASE_MS: "30000"
     ports:
       - "127.0.0.1:8080:8080"
+    volumes:
+      - skedly_scheduler_data:/data
     healthcheck:
       test:
         - CMD
@@ -22,3 +24,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+volumes:
+  skedly_scheduler_data:
