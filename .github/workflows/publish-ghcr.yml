@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - milestone/media
+      - milestone/media-rebinding
   workflow_dispatch:
 
 # Candidate releases deliberately never update latest or deploy anything.

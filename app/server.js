@@ -442,6 +442,7 @@ async function handleRequest(req, res) {
       if (!input || typeof input !== 'object' || Array.isArray(input)) return json(res, 400, { error: 'invalid_body' });
       const updates = [];
       const values = [];
+      let requestedPayload = null;
 
       if ('scheduledAt' in input) {
         if (!isIsoDate(input.scheduledAt)) return json(res, 400, { error: 'scheduledAt_must_be_iso_datetime' });
@@ -465,21 +466,71 @@ async function handleRequest(req, res) {
       if ('payload' in input) {
         const payloadError = validatePayload(current.type, input.payload);
         if (payloadError) return json(res, 400, { error: payloadError });
-        if (current.type !== 'text' && input.payload.mediaId.trim() !== current.media_id) {
-          return json(res, 409, { error: 'media_rebinding_not_supported' });
-        }
+        requestedPayload = canonicalPayload(current.type, input.payload);
         updates.push('payload_json = ?');
-        values.push(JSON.stringify(canonicalPayload(current.type, input.payload)));
+        values.push(JSON.stringify(requestedPayload));
       }
 
       if (!updates.length) return json(res, 400, { error: 'no_supported_fields_to_update' });
-      updates.push('updated_at = ?');
-      values.push(nowIso());
-      values.push(id);
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        // The worker claims jobs under the same writer lock. Re-read after taking
+        // it so either this whole PATCH commits first or a completed claim wins.
+        const fenced = getMessageStmt.get(id);
+        if (!fenced) {
+          throw Object.assign(new Error('message_not_found'), { statusCode: 404 });
+        }
+        if (fenced.status !== 'pending') {
+          throw Object.assign(new Error('only_pending_messages_can_be_modified'), { statusCode: 409 });
+        }
 
-      const statement = db.prepare(`UPDATE messages SET ${updates.join(', ')} WHERE id = ? AND status = 'pending'`);
-      const result = statement.run(...values);
-      if (result.changes !== 1) return json(res, 409, { error: 'update_conflict' });
+        const transactionUpdates = [...updates];
+        const transactionValues = [...values];
+        const updatedAt = nowIso();
+        const requestedMediaId = requestedPayload && fenced.type !== 'text' ? requestedPayload.mediaId : null;
+        const isRebinding = requestedMediaId !== null && requestedMediaId !== fenced.media_id;
+
+        if (isRebinding) {
+          mediaStore.requireBindable(requestedMediaId, fenced.type, id);
+          if (!fenced.media_id) {
+            throw Object.assign(new Error('media_binding_missing'), { statusCode: 409 });
+          }
+
+          // media.bound_message_id is UNIQUE, so release A before binding B.
+          // Every step remains invisible until COMMIT and rolls back together.
+          // A is tombstoned but never unlinked here; normal cleanup owns I/O.
+          const released = db.prepare(`UPDATE media
+            SET bound_message_id = NULL, deleted_at = ?
+            WHERE id = ? AND bound_message_id = ? AND deleted_at IS NULL`)
+            .run(updatedAt, fenced.media_id, id);
+          if (released.changes !== 1) {
+            throw Object.assign(new Error('media_binding_conflict'), { statusCode: 409 });
+          }
+
+          const bound = db.prepare(`UPDATE media SET bound_message_id = ?
+            WHERE id = ? AND deleted_at IS NULL
+              AND (bound_message_id IS NULL OR bound_message_id = ?)`)
+            .run(id, requestedMediaId, id);
+          if (bound.changes !== 1) {
+            throw Object.assign(new Error('media_binding_conflict'), { statusCode: 409 });
+          }
+          transactionUpdates.push('media_id = ?');
+          transactionValues.push(requestedMediaId);
+        }
+
+        transactionUpdates.push('updated_at = ?');
+        transactionValues.push(updatedAt, id);
+        const statement = db.prepare(`UPDATE messages SET ${transactionUpdates.join(', ')}
+          WHERE id = ? AND status = 'pending'`);
+        const result = statement.run(...transactionValues);
+        if (result.changes !== 1) {
+          throw Object.assign(new Error('update_conflict'), { statusCode: 409 });
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        try { db.exec('ROLLBACK'); } catch {}
+        throw error;
+      }
       return json(res, 200, serializeMessage(getMessageStmt.get(id)));
     }
   }

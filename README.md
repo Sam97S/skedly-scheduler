@@ -116,8 +116,24 @@ Existing endpoints remain:
 - `DELETE /v1/messages/:id` for pending messages
 - `GET /health` public; `GET /status` authenticated
 
-PATCH can update image/file caption or voice followup text using the same mediaId.
-It cannot rebind an asset or change type. Text PATCH retains M4 behavior.
+PATCH can update image/file caption or voice followup text and can atomically
+replace the media of a still-pending image/file/voice message. The replacement
+must exist, have a live physical file, match the message kind and not belong to
+another message. The message id, clientMessageId, type, status and attempts do
+not change; schedule, chat and session change only when explicitly supplied.
+
+Rebinding uses the same SQLite writer lock as the worker claim. If PATCH commits
+first, the worker later sees and delivers the replacement. If the worker changes
+the message to `processing` first, PATCH returns 409 without altering either
+asset or the payload. Supplying the current mediaId remains a normal metadata
+PATCH and does not touch media bindings.
+
+After a successful A -> B replacement, A is unbound and tombstoned in the same
+transaction, so it cannot be scheduled again. Its file is not deleted inside the
+PATCH transaction: the existing cleanup process performs the physical unlink.
+B is bound atomically with `messages.media_id` and `payload_json`. If upload B is
+followed by a failed PATCH or no PATCH, B remains an ordinary unbound upload and
+keeps the existing 24-hour orphan retention. Message type cannot be changed.
 
 ## Delivery and crash recovery
 
@@ -193,6 +209,7 @@ Cleanup runs hourly and at startup, with no dependence on Android.
 | Sent | 24 hours after sent_at |
 | Failed / unknown | 7 days after terminal updated_at |
 | Cancelled scheduled message | Next cleanup when no message references it |
+| Replaced attachment | Tombstoned at rebinding commit; physical unlink by next cleanup |
 
 Cleanup tombstones under SQLite's writer lock **before** unlinking. Scheduling
 uses the same lock, preventing cleanup/binding races. A restart retries unfinished
@@ -209,6 +226,9 @@ Tests cover auth, text CRUD and scheduling, M4 schema upgrade, SHA, upload size
 boundaries, idempotency/restart, atomic binding, all voice fallback steps,
 confirmed voice recovery, ambiguous followup, actual SIGKILL during delivery,
 lease fencing, integrity failures, retention and periodic/crash-safe cleanup.
+They also cover atomic image/file/voice rebinding, combined caption/followup
+updates, same-media PATCH, deterministic validation failures, worker/PATCH races,
+forced transaction rollback, replaced-media cleanup and DELETE regression.
 Crash-boundary tests seed the exact durable checkpoint states without adding
 any test-only API to production.
 

@@ -129,7 +129,8 @@ test('binding is atomic, rejects missing/deleted/mismatched/already bound assets
   assert.equal(message.status,201); assert.equal(fileFor(f,asset.id).bound_message_id,message.body.id);
   assert.equal((await f.create('file',{mediaId:asset.id},opts)).body.id,message.body.id);
   assert.equal((await f.create('file',{mediaId:asset.id})).status,409);
-  assert.equal((await f.api(`/v1/messages/${message.body.id}`,{method:'PATCH',body:{payload:{mediaId:randomUUID()}}})).status,409);
+  const missingRebind = await f.api(`/v1/messages/${message.body.id}`,{method:'PATCH',body:{payload:{mediaId:randomUUID()}}});
+  assert.equal(missingRebind.status,400); assert.equal(missingRebind.body.error,'media_not_found_or_deleted');
   const deleted = (await f.upload()).body;
   f.sql(db=>db.prepare('UPDATE media SET deleted_at = ? WHERE id = ?').run(new Date().toISOString(),deleted.id));
   assert.equal((await f.create('file',{mediaId:deleted.id})).status,400);
