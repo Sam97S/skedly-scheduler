@@ -440,38 +440,6 @@ async function handleRequest(req, res) {
 
       const input = await readJson(req);
       if (!input || typeof input !== 'object' || Array.isArray(input)) return json(res, 400, { error: 'invalid_body' });
-      const updates = [];
-      const values = [];
-      let requestedPayload = null;
-
-      if ('scheduledAt' in input) {
-        if (!isIsoDate(input.scheduledAt)) return json(res, 400, { error: 'scheduledAt_must_be_iso_datetime' });
-        updates.push('scheduled_at = ?');
-        values.push(new Date(input.scheduledAt).toISOString());
-      }
-      if ('timezone' in input) {
-        updates.push('timezone = ?');
-        values.push(typeof input.timezone === 'string' && input.timezone.trim() ? input.timezone.trim() : null);
-      }
-      if ('chatId' in input) {
-        if (typeof input.chatId !== 'string' || !input.chatId.trim()) return json(res, 400, { error: 'invalid_chatId' });
-        updates.push('chat_id = ?');
-        values.push(input.chatId.trim());
-      }
-      if ('session' in input) {
-        if (typeof input.session !== 'string' || !input.session.trim()) return json(res, 400, { error: 'invalid_session' });
-        updates.push('session = ?');
-        values.push(input.session.trim());
-      }
-      if ('payload' in input) {
-        const payloadError = validatePayload(current.type, input.payload);
-        if (payloadError) return json(res, 400, { error: payloadError });
-        requestedPayload = canonicalPayload(current.type, input.payload);
-        updates.push('payload_json = ?');
-        values.push(JSON.stringify(requestedPayload));
-      }
-
-      if (!updates.length) return json(res, 400, { error: 'no_supported_fields_to_update' });
       db.exec('BEGIN IMMEDIATE');
       try {
         // The worker claims jobs under the same writer lock. Re-read after taking
@@ -484,38 +452,79 @@ async function handleRequest(req, res) {
           throw Object.assign(new Error('only_pending_messages_can_be_modified'), { statusCode: 409 });
         }
 
-        const transactionUpdates = [...updates];
-        const transactionValues = [...values];
+        const patchError = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
+        const targetType = 'type' in input ? input.type : fenced.type;
+        if (!['text', 'image', 'file', 'voice'].includes(targetType)) throw patchError('invalid_type');
+        const typeChanged = targetType !== fenced.type;
+        const hasPayload = 'payload' in input;
+        if (typeChanged && !hasPayload) throw patchError('type_change_requires_payload');
+        const finalPayload = hasPayload ? input.payload : safeJsonParse(fenced.payload_json);
+        const payloadError = validatePayload(targetType, finalPayload);
+        if (payloadError) throw patchError(payloadError);
+        const payload = canonicalPayload(targetType, finalPayload);
+
+        const transactionUpdates = [];
+        const transactionValues = [];
+        if ('scheduledAt' in input) {
+          if (!isIsoDate(input.scheduledAt)) throw patchError('scheduledAt_must_be_iso_datetime');
+          transactionUpdates.push('scheduled_at = ?');
+          transactionValues.push(new Date(input.scheduledAt).toISOString());
+        }
+        if ('timezone' in input) {
+          transactionUpdates.push('timezone = ?');
+          transactionValues.push(typeof input.timezone === 'string' && input.timezone.trim() ? input.timezone.trim() : null);
+        }
+        if ('chatId' in input) {
+          if (typeof input.chatId !== 'string' || !input.chatId.trim()) throw patchError('invalid_chatId');
+          transactionUpdates.push('chat_id = ?');
+          transactionValues.push(input.chatId.trim());
+        }
+        if ('session' in input) {
+          if (typeof input.session !== 'string' || !input.session.trim()) throw patchError('invalid_session');
+          transactionUpdates.push('session = ?');
+          transactionValues.push(input.session.trim());
+        }
+        if ('type' in input) {
+          transactionUpdates.push('type = ?');
+          transactionValues.push(targetType);
+        }
+        if (hasPayload) {
+          transactionUpdates.push('payload_json = ?', 'media_id = ?');
+          transactionValues.push(JSON.stringify(payload), targetType === 'text' ? null : payload.mediaId);
+        }
+        if (!transactionUpdates.length) throw patchError('no_supported_fields_to_update');
+
         const updatedAt = nowIso();
-        const requestedMediaId = requestedPayload && fenced.type !== 'text' ? requestedPayload.mediaId : null;
-        const isRebinding = requestedMediaId !== null && requestedMediaId !== fenced.media_id;
+        const oldMediaId = fenced.media_id;
+        const newMediaId = targetType === 'text' ? null : payload.mediaId;
+        const mediaChanged = hasPayload && newMediaId !== oldMediaId;
 
-        if (isRebinding) {
-          mediaStore.requireBindable(requestedMediaId, fenced.type, id);
-          if (!fenced.media_id) {
-            throw Object.assign(new Error('media_binding_missing'), { statusCode: 409 });
-          }
+        // Even reusing the same id across a type change must match the new kind.
+        if (newMediaId && (mediaChanged || typeChanged)) mediaStore.requireBindable(newMediaId, targetType, id);
+        if (mediaChanged && fenced.type !== 'text' && !oldMediaId) throw patchError('media_binding_missing', 409);
 
+        if (mediaChanged && oldMediaId) {
           // media.bound_message_id is UNIQUE, so release A before binding B.
           // Every step remains invisible until COMMIT and rolls back together.
           // A is tombstoned but never unlinked here; normal cleanup owns I/O.
           const released = db.prepare(`UPDATE media
             SET bound_message_id = NULL, deleted_at = ?
             WHERE id = ? AND bound_message_id = ? AND deleted_at IS NULL`)
-            .run(updatedAt, fenced.media_id, id);
+            .run(updatedAt, oldMediaId, id);
           if (released.changes !== 1) {
             throw Object.assign(new Error('media_binding_conflict'), { statusCode: 409 });
           }
 
+        }
+
+        if (mediaChanged && newMediaId) {
           const bound = db.prepare(`UPDATE media SET bound_message_id = ?
             WHERE id = ? AND deleted_at IS NULL
               AND (bound_message_id IS NULL OR bound_message_id = ?)`)
-            .run(id, requestedMediaId, id);
+            .run(id, newMediaId, id);
           if (bound.changes !== 1) {
             throw Object.assign(new Error('media_binding_conflict'), { statusCode: 409 });
           }
-          transactionUpdates.push('media_id = ?');
-          transactionValues.push(requestedMediaId);
         }
 
         transactionUpdates.push('updated_at = ?');

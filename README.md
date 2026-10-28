@@ -116,24 +116,66 @@ Existing endpoints remain:
 - `DELETE /v1/messages/:id` for pending messages
 - `GET /health` public; `GET /status` authenticated
 
-PATCH can update image/file caption or voice followup text and can atomically
-replace the media of a still-pending image/file/voice message. The replacement
-must exist, have a live physical file, match the message kind and not belong to
-another message. The message id, clientMessageId, type, status and attempts do
-not change; schedule, chat and session change only when explicitly supplied.
+### Atomic content replacement with PATCH
 
-Rebinding uses the same SQLite writer lock as the worker claim. If PATCH commits
-first, the worker later sees and delivers the replacement. If the worker changes
-the message to `processing` first, PATCH returns 409 without altering either
-asset or the payload. Supplying the current mediaId remains a normal metadata
-PATCH and does not touch media bindings.
+A pending job represents a scheduled message whose content **and type** can
+change until the worker claims it. `PATCH /v1/messages/:id` accepts optional
+`type` (`text`, `image`, `file`, `voice`) and the complete final `payload` from
+the table above. All 16 source/target type combinations are supported.
 
-After a successful A -> B replacement, A is unbound and tombstoned in the same
-transaction, so it cannot be scheduled again. Its file is not deleted inside the
-PATCH transaction: the existing cleanup process performs the physical unlink.
-B is bound atomically with `messages.media_id` and `payload_json`. If upload B is
-followed by a failed PATCH or no PATCH, B remains an ordinary unbound upload and
-keeps the existing 24-hour orphan retention. Message type cannot be changed.
+If `type` is omitted, the current type is read under the writer lock and the
+existing text/caption/followup editing contract applies. If `type` changes,
+`payload` is mandatory and validated against the **target** type. For example:
+
+```json
+{"type":"text","payload":{"text":"Text replacing an image or voice"}}
+```
+
+```json
+{"type":"file","payload":{"mediaId":"new-upload-id","caption":"Updated document"}}
+```
+
+There are no implicit caption-to-text or followup-to-text conversions: clients
+must supply the explicit final payload. Text must be nonempty; media messages
+must reference an existing, nondeleted upload with a physical file, the target
+kind and no ownership by another message. No `empty` type is introduced.
+
+Success returns HTTP 200 with the final serialized message. The message id,
+clientMessageId, createdAt, status and attempts are preserved; schedule, chat,
+session and timezone change only when explicitly supplied.
+
+The entire replacement uses `BEGIN IMMEDIATE`, the same SQLite writer lock as
+the worker claim. State, target type, final payload and media are validated after
+re-reading the message under that lock. Type, payload, media_id, reverse binding,
+tombstones, updated_at and any other supplied PATCH fields commit together.
+If PATCH commits first, the worker sees only the new content and type. If the
+worker claims first, PATCH returns 409 with no content or binding changes, even
+if the request started before the claim but its body arrived later. Any failure
+rolls back every change. DELETE semantics and delivery recovery are unchanged.
+
+| Replacement | Media effect in the transaction |
+| --- | --- |
+| Media A -> text | Unbind/tombstone A, clear media_id, store explicit text |
+| Text -> media B | Validate B against the target kind, bind B, set media_id |
+| Media A -> media B, same or different kind | Validate B, unbind/tombstone A, bind B and update type/payload/media_id |
+| Same type and mediaId | Normal metadata PATCH; no rebinding or tombstone |
+
+A tombstoned A cannot be scheduled again. Its physical file is never removed
+inside PATCH; the existing cleanup process unlinks it after commit. If upload B
+is followed by a failed PATCH or no PATCH, B stays unbound and retains the
+existing 24-hour orphan retention. A bound pending B remains protected regardless
+of upload age. Sent/failed/unknown retention and all cleanup policies stay intact.
+
+| PATCH error | HTTP |
+| --- | --- |
+| Invalid target type (`invalid_type`) | 400 |
+| Changed type without payload (`type_change_requires_payload`) | 400 |
+| Invalid/empty/incompatible final payload | 400 |
+| Missing/deleted upload or missing physical file (`media_not_found_or_deleted`) | 400 |
+| Wrong target kind (`media_kind_mismatch`) | 400 |
+| Media owned by another job (`media_already_bound`) | 409 |
+| Message not pending, binding/update conflict | 409 |
+| Message no longer exists | 404 |
 
 ## Delivery and crash recovery
 
@@ -229,6 +271,9 @@ lease fencing, integrity failures, retention and periodic/crash-safe cleanup.
 They also cover atomic image/file/voice rebinding, combined caption/followup
 updates, same-media PATCH, deterministic validation failures, worker/PATCH races,
 forced transaction rollback, replaced-media cleanup and DELETE regression.
+Content replacement tests exercise all 16 type transitions and actual delivery
+of the final content, delayed-body PATCH races, concurrent B ownership, validation
+and SQLite failures with full rollback, cross-type cleanup and idempotency.
 Crash-boundary tests seed the exact durable checkpoint states without adding
 any test-only API to production.
 
